@@ -39,36 +39,78 @@ jobs:
         docker build -t $DOCKER_IMAGE:latest .
         docker save $DOCKER_IMAGE:latest | gzip > nptrack-api.tar.gz
     
-    - name: Transfer and Deploy to Digital Ocean Droplet
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets.DROPLET_HOST }}
-        username: ${{ secrets.DROPLET_USERNAME }}
-        key: ${{ secrets.DROPLET_SSH_KEY }}
-        port: ${{ secrets.DROPLET_PORT }}
-        script: |
-          # Create temp directory
-          mkdir -p /tmp/deploy
-          cd /tmp/deploy
-          
-          # Stop existing services
-          cd /opt/nptrack-api
-          docker-compose down || true
-          
-          # Remove old image if exists
-          docker rmi nptrack-api:latest || true
+    - name: Prepare deployment files
+      run: |
+        # Create deployment package
+        mkdir -p deploy-package
+        cp nptrack-api.tar.gz deploy-package/
+        cp deploy/docker-compose.prod.yml deploy-package/docker-compose.yml
+        cp -r deploy/nginx deploy-package/
+        cp -r sql deploy-package/
+        cp -r appconfig deploy-package/
+        
+        # Create deployment script
+        cat > deploy-package/deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting direct deployment..."
+        
+        # Stop existing services
+        docker-compose down || true
+        
+        # Remove old image if exists
+        docker rmi nptrack-api:latest || true
+        
+        # Load the new image
+        echo "📦 Loading Docker image..."
+        gunzip -c nptrack-api.tar.gz | docker load
+        
+        # Update docker-compose to use local image
+        echo "⚙️ Updating configuration..."
+        sed -i "s|image: registry\.digitalocean\.com/.*nptrack-api.*|image: nptrack-api:latest|g" docker-compose.yml
+        
+        # Start services
+        echo "🔄 Starting services..."
+        docker-compose up -d
+        
+        # Health check
+        echo "🏥 Performing health check..."
+        sleep 30
+        for i in {1..10}; do
+          if curl -f http://localhost:6446/health; then
+            echo "✅ Application is healthy!"
+            break
+          fi
+          echo "⏳ Waiting for application... (attempt $i/10)"
+          sleep 10
+        done
+        
+        # Final check
+        if ! curl -f http://localhost:6446/health; then
+          echo "❌ Health check failed after 10 attempts"
+          echo "📋 Container logs:"
+          docker-compose logs
+          exit 1
+        fi
+        
+        echo "🎉 Direct deployment completed successfully!"
+        EOF
+        
+        chmod +x deploy-package/deploy.sh
     
-    - name: Copy Docker image to droplet
+    - name: Copy deployment package to droplet
       uses: appleboy/scp-action@v0.1.7
       with:
         host: ${{ secrets.DROPLET_HOST }}
         username: ${{ secrets.DROPLET_USERNAME }}
         key: ${{ secrets.DROPLET_SSH_KEY }}
         port: ${{ secrets.DROPLET_PORT }}
-        source: nptrack-api.tar.gz
-        target: /tmp/deploy/
+        source: deploy-package/*
+        target: /tmp/
+        strip_components: 1
     
-    - name: Load and start Docker containers
+    - name: Deploy on droplet
       uses: appleboy/ssh-action@v1.0.3
       with:
         host: ${{ secrets.DROPLET_HOST }}
@@ -76,22 +118,29 @@ jobs:
         key: ${{ secrets.DROPLET_SSH_KEY }}
         port: ${{ secrets.DROPLET_PORT }}
         script: |
-          # Load the new image
-          cd /tmp/deploy
-          gunzip -c nptrack-api.tar.gz | docker load
+          # Ensure application directory exists
+          mkdir -p /opt/nptrack-api
           
-          # Update docker-compose to use local image
+          # Copy deployment files to application directory
+          cp -r /tmp/deploy-package/* /opt/nptrack-api/
+          
+          # Set up environment if it doesn't exist
           cd /opt/nptrack-api
-          sed -i "s|image: .*nptrack-api.*|image: nptrack-api:latest|g" docker-compose.yml
+          if [ ! -f .env ]; then
+            cat > .env << 'EOF'
+          DATABASE_PASSWORD=YourStr0ng!Pass
+          DATABASE_NAME=NpTrack
+          DATABASE_SERVER_TIME_ZONE=EAT
+          REGISTRY_NAME=local
+          EOF
+          fi
           
-          # Start services
-          docker-compose up -d
+          # Make logs directory
+          mkdir -p logs
           
-          # Health check
-          sleep 30
-          curl -f http://localhost:6446/health || exit 1
+          # Run deployment
+          chmod +x deploy.sh
+          ./deploy.sh
           
-          # Cleanup
-          rm -rf /tmp/deploy
-          
-          echo "Direct deployment completed successfully!" 
+          # Cleanup temp files
+          rm -rf /tmp/deploy-package 

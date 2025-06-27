@@ -1,0 +1,97 @@
+name: Deploy Direct to Digital Ocean (No Registry)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  DOCKER_IMAGE: nptrack-api
+  DOCKER_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build and test Docker image
+      run: |
+        docker build -t $DOCKER_IMAGE:$DOCKER_TAG .
+        docker run --rm $DOCKER_IMAGE:$DOCKER_TAG java -version
+
+  deploy-direct:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Build Docker image
+      run: |
+        docker build -t $DOCKER_IMAGE:latest .
+        docker save $DOCKER_IMAGE:latest | gzip > nptrack-api.tar.gz
+    
+    - name: Transfer and Deploy to Digital Ocean Droplet
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USERNAME }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.DROPLET_PORT }}
+        script: |
+          # Create temp directory
+          mkdir -p /tmp/deploy
+          cd /tmp/deploy
+          
+          # Stop existing services
+          cd /opt/nptrack-api
+          docker-compose down || true
+          
+          # Remove old image if exists
+          docker rmi nptrack-api:latest || true
+    
+    - name: Copy Docker image to droplet
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USERNAME }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.DROPLET_PORT }}
+        source: nptrack-api.tar.gz
+        target: /tmp/deploy/
+    
+    - name: Load and start Docker containers
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DROPLET_HOST }}
+        username: ${{ secrets.DROPLET_USERNAME }}
+        key: ${{ secrets.DROPLET_SSH_KEY }}
+        port: ${{ secrets.DROPLET_PORT }}
+        script: |
+          # Load the new image
+          cd /tmp/deploy
+          gunzip -c nptrack-api.tar.gz | docker load
+          
+          # Update docker-compose to use local image
+          cd /opt/nptrack-api
+          sed -i "s|image: .*nptrack-api.*|image: nptrack-api:latest|g" docker-compose.yml
+          
+          # Start services
+          docker-compose up -d
+          
+          # Health check
+          sleep 30
+          curl -f http://localhost:6446/health || exit 1
+          
+          # Cleanup
+          rm -rf /tmp/deploy
+          
+          echo "Direct deployment completed successfully!" 

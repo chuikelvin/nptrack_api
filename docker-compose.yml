@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  # MSSQL Server 2019
+  mssql-server:
+    image: mcr.microsoft.com/mssql/server:2019-latest
+    container_name: nptrack-mssql
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=${DATABASE_PASSWORD:-YourStr0ng!Pass}
+      - MSSQL_PID=Express
+    ports:
+      - "15435:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+      - ./sql:/sql
+    command: >
+      bash -c "
+        /opt/mssql/bin/sqlservr &
+        sleep 30
+        /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DATABASE_PASSWORD:-YourStr0ng!Pass} -C -i /sql/init-database.sql
+        wait
+      "
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${DATABASE_PASSWORD:-YourStr0ng!Pass} -C -Q 'SELECT 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # Java Application - Use local image or build from Dockerfile
+  nptrack-app:
+    # For local deployment without registry
+    # image: nptrack-api:latest
+    # Alternative: build from Dockerfile
+    build: .
+    container_name: nptrack-app
+    ports:
+      - "6446:6446"
+    volumes:
+      - ./logs:/app/logs
+      - ./appconfig:/app/appconfig
+    environment:
+      - DATABASE_IP=mssql-server
+      - DATABASE_PORT=1433
+      - DATABASE_NAME=${DATABASE_NAME:-NpTrack}
+      - DATABASE_USER=sa
+      - DATABASE_PASSWORD=${DATABASE_PASSWORD:-YourStr0ng!Pass}
+      - SYSTEM_HOST=0.0.0.0
+      - SYSTEM_PORT=6446
+      - LOGS_PATH=logs
+      - DATABASE_DRIVER=com.microsoft.sqlserver.jdbc.SQLServerDriver
+      - DATABASE_SERVER_TIME_ZONE=${DATABASE_SERVER_TIME_ZONE:-EAT}
+    depends_on:
+      mssql-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  mssql_data:
+    driver: local
